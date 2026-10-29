@@ -12,6 +12,14 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
@@ -53,6 +61,28 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
     return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
 
 
+@eager_on_graph
+def bcg_npu_dsa_indexer(
+    indexer, x, q_lora, positions, out, layer_id, input_on_attn_tp_slices, dynamic_scale
+) -> None:
+    batch = get_forward_batch()
+    n = batch.global_num_token_non_padded_cpu
+    out.fill_(-1)
+    if n == 0:
+        return
+    result = indexer._forward_npu_eager(
+        x,
+        q_lora,
+        positions,
+        batch,
+        layer_id,
+        input_on_attn_tp_slices,
+        dynamic_scale,
+        real_num_tokens=n,
+    )
+    out[:n].copy_(result)
+
+
 class DSANPUIndexerMixin:
     def forward_npu(
         self,
@@ -63,6 +93,49 @@ class DSANPUIndexerMixin:
         layer_id: int,
         input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if (
+            is_in_breakable_cuda_graph()
+            and is_in_prefill_graph_scope()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            out = torch.empty(
+                (q_lora.shape[0], self.index_topk),
+                dtype=torch.int32,
+                device=q_lora.device,
+            )
+            bcg_npu_dsa_indexer(
+                self,
+                x,
+                q_lora,
+                positions,
+                out,
+                layer_id,
+                input_on_attn_tp_slices,
+                dynamic_scale,
+            )
+            return out
+        return self._forward_npu_eager(
+            x,
+            q_lora,
+            positions,
+            forward_batch,
+            layer_id,
+            input_on_attn_tp_slices,
+            dynamic_scale,
+        )
+
+    def _forward_npu_eager(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        input_on_attn_tp_slices: bool = False,
+        dynamic_scale: torch.Tensor = None,
+        *,
+        real_num_tokens: int = None,
     ) -> torch.Tensor:
         # DSA prefill CP metadata is Ascend-local and is first consumed by this
         # indexer (before the attention backend's forward_extend), so prepare it
@@ -214,7 +287,23 @@ class DSANPUIndexerMixin:
                 torch.npu.current_stream(),
             )
 
+        if real_num_tokens is not None:
+            # Keep padded projection/all-gather shapes: x can be a TP shard,
+            # while q_lora already carries the full token axis. Slice only
+            # after all projections and their stream dependencies complete.
+            if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+                torch.npu.current_stream().wait_event(q_rope_event)
+            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+                torch.npu.current_stream().wait_event(weights_event)
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
+                weights = scattered_to_tp_attn_full(weights, forward_batch)
+            q = q[:real_num_tokens]
+            k = k[:real_num_tokens]
+            weights = weights[:real_num_tokens]
+
         indexer_cache_loc = forward_batch.out_cache_loc
+        if real_num_tokens is not None:
+            indexer_cache_loc = indexer_cache_loc[:real_num_tokens]
         parallel = get_parallel()
         if (
             parallel.dcp_enabled
@@ -281,12 +370,13 @@ class DSANPUIndexerMixin:
 
         past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
 
-        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
-            torch.npu.current_stream().wait_event(q_rope_event)
-        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
-            torch.npu.current_stream().wait_event(weights_event)
-        if _use_ag_after_qlora and input_on_attn_tp_slices:
-            weights = scattered_to_tp_attn_full(weights, forward_batch)
+        if real_num_tokens is None:
+            if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+                torch.npu.current_stream().wait_event(q_rope_event)
+            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+                torch.npu.current_stream().wait_event(weights_event)
+            if _use_ag_after_qlora and input_on_attn_tp_slices:
+                weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
         if (
             is_prefill

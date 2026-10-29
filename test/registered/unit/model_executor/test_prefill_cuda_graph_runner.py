@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    DSV4OutCacheLoc,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
@@ -252,6 +253,21 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(captured, [batch])
         self.assertIs(backend, attention_backend)
 
+    def test_capture_prepare_runs_backend_hook_before_binding_ids(self):
+        runner, _, _, _ = self._capture_runner(
+            prefill_backend_name=Backend.BREAKABLE, capture_req_slots=1
+        )
+        bundle = object()
+
+        def prepare_capture_batch(batch):
+            self.assertIsNone(batch.iteration_ids)
+            batch.out_cache_loc_dsv4 = bundle
+
+        runner.backend = SimpleNamespace(prepare_capture_batch=prepare_capture_batch)
+        batch, _ = runner.capture_prepare(4)
+        self.assertIs(batch.out_cache_loc_dsv4, bundle)
+        self.assertIsNotNone(batch.iteration_ids)
+
     def test_capture_prepare_marks_full_prefill_capture(self):
         """Only Full capture batches carry zero-length padding request slots.
 
@@ -388,7 +404,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+    def test_static_batch_preserves_per_batch_side_channels(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
@@ -413,6 +429,12 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._prepare_forward_metadata_for_replay = lambda *_args: None
 
         mm_input_embeds = torch.randn(3, 8)
+        bundle = DSV4OutCacheLoc(
+            out_full_loc=torch.arange(3),
+            out_swa_loc=torch.arange(3) + 8,
+            out_c4_loc=torch.empty(0, dtype=torch.int64),
+            out_c128_loc=torch.empty(0, dtype=torch.int64),
+        )
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=1,
@@ -420,6 +442,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             req_pool_indices=torch.zeros(1, dtype=torch.int64),
             seq_lens=torch.tensor([3], dtype=torch.int32),
             out_cache_loc=torch.arange(3, dtype=torch.int64),
+            out_cache_loc_dsv4=bundle,
             seq_lens_sum=3,
             positions=torch.arange(3, dtype=torch.int64),
             seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
@@ -438,6 +461,18 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         static_batch, _ = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+        self.assertIs(static_batch.out_cache_loc_dsv4, bundle)
+        next_bundle = DSV4OutCacheLoc(
+            bundle.out_full_loc + 16,
+            bundle.out_swa_loc + 16,
+            bundle.out_c4_loc,
+            bundle.out_c128_loc,
+        )
+        forward_batch.out_cache_loc_dsv4 = next_bundle
+        forward_batch.out_cache_loc = next_bundle.out_full_loc
+        runner_ids.bind_own_plan(forward_batch)
+        next_static_batch, _ = runner.load_batch(forward_batch)
+        self.assertIs(next_static_batch.out_cache_loc_dsv4, next_bundle)
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(

@@ -7,6 +7,7 @@ capture runs on NPU.
 """
 
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -48,6 +49,43 @@ def _flags(*, enable_torch_compile=False):
 
 
 class TestBreakableNPUGraphBackend(CustomTestCase):
+    def test_capture_releases_dummy_kv_after_parent_exit_even_on_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                events = []
+
+                @contextmanager
+                def parent_session(_self, _stream):
+                    try:
+                        yield
+                    finally:
+                        events.append("parent exit")
+
+                backend = mod.BreakableNPUGraphBackend.__new__(
+                    mod.BreakableNPUGraphBackend
+                )
+                backend._device_module = SimpleNamespace(
+                    synchronize=lambda: events.append("sync")
+                )
+                backend._capture_kv = SimpleNamespace(
+                    close=lambda: events.append("free")
+                )
+                with (
+                    mock.patch.object(
+                        BreakableCudaGraphBackend, "capture_session", parent_session
+                    ),
+                    (
+                        self.assertRaisesRegex(RuntimeError, "capture failed")
+                        if fail
+                        else nullcontext()
+                    ),
+                ):
+                    with backend.capture_session(object()):
+                        if fail:
+                            raise RuntimeError("capture failed")
+                self.assertEqual(events, ["parent exit", "sync", "free", "sync"])
+                self.assertIsNone(backend._capture_kv)
+
     def test_construction_reuses_parent_backend(self):
         runner = _make_runner()
         with (

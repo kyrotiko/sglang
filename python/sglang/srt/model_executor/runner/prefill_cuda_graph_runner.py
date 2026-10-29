@@ -1667,6 +1667,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.prefill_backend_name == Backend.FULL
                 ),
             )
+            prepare_capture_batch = getattr(
+                getattr(self, "backend", None), "prepare_capture_batch", None
+            )
+            if prepare_capture_batch is not None:
+                prepare_capture_batch(forward_batch)
             self.model_runner.runner_ids.bind_runner_slots(forward_batch)
             ngram_manager = self.model_runner.ngram_embedding_manager
             if ngram_manager.enabled:
@@ -1838,11 +1843,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.backend.capture_one(
             shape_key,
             run_once,
-            # DP padding can install capture-only tensors on this dummy batch;
-            # BCG retains it so their recorded addresses remain valid.
+            # DP padding and DSV4 setup can install capture-only tensors on this
+            # dummy batch; retain their storage for the graph's lifetime.
             capture_inputs=(
                 forward_batch
                 if forward_batch.global_num_tokens_gpu is not None
+                or forward_batch.out_cache_loc_dsv4 is not None
                 else None
             ),
             post_warmup_hook=post_warmup_hook,
@@ -1993,6 +1999,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
             seq_lens_sum=forward_batch.seq_lens_sum,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,

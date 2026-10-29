@@ -21,6 +21,14 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
@@ -42,6 +50,44 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
 
 
 # region MHA
+@eager_on_graph
+def bcg_mla_kv_norm_rope_cache(m, latent_cache, cos, sin, k_pe_out, kv_a_out) -> None:
+    batch = get_forward_batch()
+    n = batch.global_num_token_non_padded_cpu
+    if n:
+        ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+        _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+            latent_cache[:n].reshape(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),
+            m.kv_a_layernorm.weight,
+            cos[:n],
+            sin[:n],
+            batch.out_cache_loc[:n].to(torch.int64),
+            k_rope_cache,
+            ckv_cache,
+            k_rope_scale=None,
+            c_kv_scale=None,
+            k_rope_offset=None,
+            c_kv_offset=None,
+            epsilon=m.kv_a_layernorm.variance_epsilon,
+            cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+            is_output_kv=True,
+        )
+        k_pe_out[:n].view(k_pe.shape).copy_(k_pe)
+        kv_a_out[:n].view(kv_a.shape).copy_(kv_a)
+    k_pe_out[n:].zero_()
+    kv_a_out[n:].zero_()
+
+
+@eager_on_graph
+def bcg_mla_store_kv(m, kv_a, k_pe) -> None:
+    batch = get_forward_batch()
+    n = batch.global_num_token_non_padded_cpu
+    if n:
+        get_token_to_kv_pool().set_kv_buffer(
+            m, batch.out_cache_loc[:n], kv_a[:n].unsqueeze(1), k_pe[:n]
+        )
+
+
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -50,6 +96,11 @@ def forward_mha_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
+    breakable_prefill = (
+        is_in_breakable_cuda_graph()
+        and is_in_prefill_graph_scope()
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    )
     if m.q_lora_rank is not None:
         q, latent_cache = (
             get_attn_tp_context()
@@ -101,23 +152,30 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
-        _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
-            latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
-            m.kv_a_layernorm.weight,
-            cos,
-            sin,
-            forward_batch.out_cache_loc.to(torch.int64),
-            k_rope_cache,
-            ckv_cache,
-            k_rope_scale=None,
-            c_kv_scale=None,
-            k_rope_offset=None,
-            c_kv_offset=None,
-            epsilon=m.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
-            is_output_kv=True,
-        )  # adapter NZ
+        if breakable_prefill:
+            k_pe = latent_cache.new_empty((B, 1, m.qk_rope_head_dim))
+            kv_a = latent_cache.new_empty((B, m.kv_lora_rank))
+            bcg_mla_kv_norm_rope_cache(m, latent_cache, cos, sin, k_pe, kv_a)
+        else:
+            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+            _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                latent_cache.view(
+                    -1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim
+                ),  # bnsd
+                m.kv_a_layernorm.weight,
+                cos,
+                sin,
+                forward_batch.out_cache_loc.to(torch.int64),
+                k_rope_cache,
+                ckv_cache,
+                k_rope_scale=None,
+                c_kv_scale=None,
+                k_rope_offset=None,
+                c_kv_offset=None,
+                epsilon=m.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+                is_output_kv=True,
+            )  # adapter NZ
 
         k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
     else:
@@ -126,9 +184,12 @@ def forward_mha_prepare_npu(
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
-        get_token_to_kv_pool().set_kv_buffer(
-            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-        )
+        if breakable_prefill:
+            bcg_mla_store_kv(m, kv_a, k_pe)
+        else:
+            get_token_to_kv_pool().set_kv_buffer(
+                m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
 
     q[..., m.qk_nope_head_dim :] = q_pe
 

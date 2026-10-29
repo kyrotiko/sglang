@@ -913,6 +913,42 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
 bcg_deepseek_v4_low_ratio_sources = eager_on_graph(deepseek_v4_low_ratio_sources)
 
 
+@eager_on_graph
+def bcg_dsv4_npu_store_cache(layer_id: int, kv: torch.Tensor) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if num_tokens == 0:
+        return
+    original_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_loc[:num_tokens]
+    try:
+        get_attn_backend().store_cache(
+            layer_id=layer_id, swa_k=kv[:num_tokens], forward_batch=forward_batch
+        )
+    finally:
+        forward_batch.out_cache_loc = original_loc
+
+
+@eager_on_graph
+def bcg_dsv4_npu_sources(layer, x, q_lora) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if num_tokens == 0:
+        return
+    attn_backend = get_attn_backend()
+    if layer.indexer is not None:
+        layer.indexer(
+            x=x[:num_tokens],
+            q_lora=q_lora[:num_tokens],
+            forward_batch=forward_batch,
+            attn_backend=attn_backend,
+        )
+    if layer.compressor is not None:
+        attn_backend.forward_core_compressor(
+            x[:num_tokens], forward_batch, layer.layer_id, layer.compressor
+        )
+
+
 def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
     """Whether the ratio-1/2 sources run as an eager break: inside a breakable graph
     without the in-graph low-ratio path, or in a decoder tail graph."""
@@ -2453,11 +2489,14 @@ class MQALayer(MqaAttentionBase):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv_for_cache,
-                forward_batch=forward_batch,
-            )
+            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                bcg_dsv4_npu_store_cache(self.layer_id, kv_for_cache)
+            else:
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv_for_cache,
+                    forward_batch=forward_batch,
+                )
             kv = None
             if q_out is not None:
                 q_out.copy_(q)
@@ -2550,6 +2589,12 @@ class MQALayer(MqaAttentionBase):
                     positions=positions,
                     forward_batch=forward_batch,
                 )
+        elif (
+            _is_npu
+            and forward_batch.forward_mode.is_extend()
+            and is_in_breakable_cuda_graph()
+        ):
+            bcg_dsv4_npu_sources(self, x, q_lora)
         else:
             use_npu_cp_full_metadata = use_cp and _is_npu
             if self.indexer is not None:
