@@ -39,6 +39,10 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.npu_graph_debug import (
+    npu_graph_debug,
+    npu_graph_debug_call,
+)
 from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
@@ -1471,6 +1475,15 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
     ):
+        npu_graph_debug(
+            "attention.sparse.entry",
+            layer=layer.layer_id,
+            batch=forward_batch,
+            q=q,
+            k=k,
+            topk=topk_indices,
+            block_table=self.forward_metadata.block_tables,
+        )
 
         is_prefill = (
             forward_batch.forward_mode.is_extend()
@@ -1481,8 +1494,13 @@ class AscendAttnBackend(AttentionBackend):
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
             k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
+            npu_graph_debug_call(
+                "attention.kv_cache.write",
+                self.token_to_kv_pool.set_kv_buffer,
+                layer,
+                forward_batch.out_cache_loc,
+                k,
+                k_rope,
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1557,7 +1575,9 @@ class AscendAttnBackend(AttentionBackend):
             if self.kv_cache_dtype == torch.float8_e4m3fn:
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
                 packed = k_nope.view(torch.float8_e4m3fn)
-                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
+                attn_out = npu_graph_debug_call(
+                    "attention.quant_sparse",
+                    torch_npu.npu_kv_quant_sparse_flash_attention,
                     query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
                     key=packed,
                     value=packed,
@@ -1567,11 +1587,17 @@ class AscendAttnBackend(AttentionBackend):
                     value_quant_mode=2,
                     key_dequant_scale=None,
                     value_dequant_scale=None,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
+                    actual_seq_lengths_query=npu_graph_debug_call(
+                        "attention.q_lengths.to",
+                        actual_seq_qlen.to,
+                        device=q_nope.device,
+                        dtype=torch.int32,
                     ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
+                    actual_seq_lengths_kv=npu_graph_debug_call(
+                        "attention.kv_lengths.to",
+                        actual_seq_lengths_kv.to,
+                        device=q_nope.device,
+                        dtype=torch.int32,
                     ),
                     block_table=self.forward_metadata.block_tables,
                     sparse_block_size=1,
@@ -1584,7 +1610,9 @@ class AscendAttnBackend(AttentionBackend):
                     rope_head_dim=self.qk_rope_head_dim,
                 )
             else:
-                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                attn_out, _, _ = npu_graph_debug_call(
+                    "attention.sparse",
+                    torch_npu.npu_sparse_flash_attention,
                     query=q_nope,
                     key=k_nope,
                     value=k_nope,
@@ -1592,11 +1620,17 @@ class AscendAttnBackend(AttentionBackend):
                     key_rope=k_pe,
                     sparse_indices=topk_indices,
                     scale_value=layer.scaling,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
+                    actual_seq_lengths_query=npu_graph_debug_call(
+                        "attention.q_lengths.to",
+                        actual_seq_qlen.to,
+                        device=q_nope.device,
+                        dtype=torch.int32,
                     ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
+                    actual_seq_lengths_kv=npu_graph_debug_call(
+                        "attention.kv_lengths.to",
+                        actual_seq_lengths_kv.to,
+                        device=q_nope.device,
+                        dtype=torch.int32,
                     ),
                     block_table=self.forward_metadata.block_tables,
                     sparse_block_size=1,
@@ -1607,6 +1641,9 @@ class AscendAttnBackend(AttentionBackend):
                     return_softmax_lse=False,
                 )
 
+        npu_graph_debug(
+            "attention.sparse.return", layer=layer.layer_id, output=attn_out
+        )
         return attn_out
 
     def forward_extend(

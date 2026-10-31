@@ -2,6 +2,10 @@
 
 import ast
 import functools
+import itertools
+import json
+import os
+import time
 import unittest
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -69,7 +73,12 @@ class _Stream:
 class TestNpuDSAIndexerBreak(unittest.TestCase):
     def setUp(self):
         self.state = SimpleNamespace(
-            batch=_batch([4]), graph=True, prefill=True, dcp=False
+            batch=_batch([4]),
+            graph=True,
+            prefill=True,
+            dcp=False,
+            debug=False,
+            indexer_break=True,
         )
         self.events, self.gathers, self.writes, self.kernels = [], [], [], []
         self.main_stream = _Stream("main", self.events)
@@ -90,6 +99,39 @@ class TestNpuDSAIndexerBreak(unittest.TestCase):
         )
         self.backend = SimpleNamespace(is_draft_worker=False)
         self._refresh_metadata()
+        debug_env = SimpleNamespace(
+            SGLANG_NPU_GRAPH_DEBUG=SimpleNamespace(get=lambda: self.state.debug),
+            SGLANG_NPU_GRAPH_DEBUG_CAPTURE=SimpleNamespace(get=lambda: False),
+            SGLANG_NPU_DSA_INDEXER_EAGER_BREAK=SimpleNamespace(
+                get=lambda: self.state.indexer_break
+            ),
+            SGLANG_NPU_USE_MULTI_STREAM=SimpleNamespace(get=lambda: self.multi_stream),
+        )
+        self.debug_logger = Mock()
+        self.debug_ns = _load_symbols(
+            "model_executor/runner_backend_utils/npu_graph_debug.py",
+            {
+                "_cpu_values",
+                "_describe",
+                "npu_graph_debug",
+                "npu_graph_debug_scope",
+                "npu_graph_debug_call",
+            },
+            {
+                "torch": torch,
+                "functools": functools,
+                "itertools": itertools,
+                "json": json,
+                "os": os,
+                "time": time,
+                "contextmanager": contextmanager,
+                "envs": debug_env,
+                "logger": self.debug_logger,
+                "_context": ContextVar("debug_test_context", default={}),
+                "_runs": itertools.count(1),
+                "_events": itertools.count(1),
+            },
+        )
         self.capture_var = ContextVar("dsa_test_capture", default=None)
         bcg = _load_symbols(
             "model_executor/runner_backend_utils/breakable_cuda_graph/"
@@ -104,6 +146,7 @@ class TestNpuDSAIndexerBreak(unittest.TestCase):
             {
                 "torch": torch,
                 "functools": functools,
+                "npu_graph_debug": self.debug_ns["npu_graph_debug"],
                 "_current_capture_var": self.capture_var,
                 "_current_stream_var": ContextVar("dsa_test_stream", default=None),
                 "get_device_module": lambda: SimpleNamespace(
@@ -139,11 +182,9 @@ class TestNpuDSAIndexerBreak(unittest.TestCase):
                 "_use_ag_after_qlora": False,
                 "attn_tp_all_gather_into_tensor": collective,
                 "get_indexer_weight_stream": lambda: self.weight_stream,
-                "envs": SimpleNamespace(
-                    SGLANG_NPU_USE_MULTI_STREAM=SimpleNamespace(
-                        get=lambda: self.multi_stream
-                    )
-                ),
+                "envs": debug_env,
+                "npu_graph_debug": self.debug_ns["npu_graph_debug"],
+                "npu_graph_debug_call": self.debug_ns["npu_graph_debug_call"],
                 "_quantize_npu_indexer_activation": lambda x, *_: (
                     x,
                     torch.ones(x.shape[:-1]),
@@ -347,6 +388,76 @@ class TestNpuDSAIndexerBreak(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.graph.replay()
         self.assertEqual(self.writes, [])
+
+    def test_trace_records_replay_order_without_changing_outputs(self):
+        self.state.debug = True
+        with self._capture():
+            out = self._run()
+        self.state.batch = _batch([3])
+        self._refresh_metadata()
+        with self.debug_ns["npu_graph_debug_scope"]("replay", bucket=4):
+            self.graph.replay()
+        events = [
+            json.loads(call.args[1])["event"]
+            for call in self.debug_logger.warning.call_args_list
+        ]
+        self.assertLess(
+            events.index("segment.submit.begin"), events.index("break.begin")
+        )
+        self.assertLess(
+            events.index("indexer.topk.begin"),
+            events.index("indexer.output.copy.return"),
+        )
+        self.assertIn("indexer.kv_lengths.to.return", events)
+        self.assertTrue((out[:3] == 3).all())
+        self.assertTrue((out[3:] == -1).all())
+
+    def test_diagnostics_can_restore_original_indexer_path(self):
+        self.state.indexer_break = False
+        with self._capture():
+            self._run()
+        self.assertEqual(self.graph._break_fns, [])
+        self.assertEqual(len(self.kernels), 1)
+        self.assertEqual(len(self.writes), 1)
+        self.debug_logger.warning.assert_not_called()
+
+    def test_capture_details_are_quiet_but_capture_errors_are_reported(self):
+        self.state.debug = True
+        with self.debug_ns["npu_graph_debug_scope"]("warmup", bucket=4):
+            self.debug_ns["npu_graph_debug"]("indexer.entry")
+        self.debug_logger.warning.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            with self.debug_ns["npu_graph_debug_scope"]("capture", bucket=4):
+                raise RuntimeError("capture failed")
+        payload = json.loads(self.debug_logger.warning.call_args.args[1])
+        self.assertEqual(payload["phase"], "capture")
+        self.assertEqual(payload["event"], "phase.error")
+
+    def test_trace_does_not_read_device_tensor_values_or_mask_errors(self):
+        self.state.debug = True
+        tensor = torch.empty(3, device="meta")
+        with (
+            patch.object(
+                torch.Tensor, "tolist", side_effect=AssertionError("device read")
+            ),
+            patch.object(
+                torch.Tensor, "cpu", side_effect=AssertionError("device copy")
+            ),
+            patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("device scalar")
+            ),
+        ):
+            result = self.debug_ns["npu_graph_debug_call"]("probe", lambda: tensor)
+            self.assertIs(result, tensor)
+        payload = json.loads(self.debug_logger.warning.call_args.args[1])
+        self.assertEqual(payload["result"]["device"], "meta")
+        failure = RuntimeError("original failure")
+        with self.assertRaises(RuntimeError) as caught:
+            with self.debug_ns["npu_graph_debug_scope"]("replay"):
+                self.debug_ns["npu_graph_debug_call"](
+                    "failing_probe", Mock(side_effect=failure)
+                )
+        self.assertIs(caught.exception, failure)
 
 
 if __name__ == "__main__":

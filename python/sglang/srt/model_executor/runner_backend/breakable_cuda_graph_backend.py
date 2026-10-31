@@ -44,6 +44,10 @@ from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import 
     HiCacheGraphEvents,
     wait_for_layer_loads,
 )
+from sglang.srt.model_executor.runner_backend_utils.npu_graph_debug import (
+    npu_graph_debug,
+    npu_graph_debug_scope,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -112,6 +116,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
+        npu_graph_debug(
+            "capture_session.begin",
+            draft=getattr(self._model_runner, "is_draft_worker", False),
+            torch_version=torch.__version__,
+            indexer_eager_break=envs.SGLANG_NPU_DSA_INDEXER_EAGER_BREAK.get(),
+            multi_stream=envs.SGLANG_NPU_USE_MULTI_STREAM.get(),
+            ag_after_qlora=envs.SGLANG_USE_AG_AFTER_QLORA.get(),
+        )
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
@@ -126,6 +138,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self.end_cuda_graph_capture()
             finally:
                 self._capture_stream = None
+                npu_graph_debug("capture_session.return")
 
     def capture_one(
         self,
@@ -135,13 +148,25 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         warmup_out = None
-        for _ in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            with self._precarve.measure():
-                warmup_out = forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        for warmup in range(2):
+            with npu_graph_debug_scope(
+                "warmup",
+                bucket=shape_key.size,
+                iteration=warmup,
+                draft=getattr(self._model_runner, "is_draft_worker", False),
+            ):
+                npu_graph_debug("warmup.sync.begin")
+                self._device_module.synchronize()
+                npu_graph_debug("warmup.sync.return")
+                npu_graph_debug("warmup.barrier.begin")
+                self._tp_group.barrier()
+                npu_graph_debug("warmup.barrier.return")
+                with self._precarve.measure():
+                    npu_graph_debug("forward.begin")
+                    warmup_out = forward_fn()
+                    npu_graph_debug("forward.return")
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
 
         graph = BreakableCUDAGraph(
             self.deduped_cuda_graph, hicache_graph_events=self._hicache_graph_events
@@ -158,6 +183,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             )
         buffer = self._shared_output_buffer
         with (
+            npu_graph_debug_scope(
+                "capture",
+                bucket=shape_key.size,
+                draft=getattr(self._model_runner, "is_draft_worker", False),
+            ),
             self._hicache_graph_events.capture_scope()
             if self._hicache_graph_events is not None
             else nullcontext(),
@@ -191,6 +221,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+        npu_graph_debug(
+            "capture_one.ready", bucket=shape_key.size, segments=len(graph._segments)
+        )
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
@@ -300,7 +333,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     ) -> Any:
         if self._enable_hicache_event_capture and self._hicache_graph_events is None:
             wait_for_layer_loads(self._model_runner.token_to_kv_pool)
-        with graph_pool_replay_scope():
+        with (
+            npu_graph_debug_scope(
+                "replay",
+                bucket=shape_key.size,
+                batch=static_forward_batch,
+                draft=getattr(self._model_runner, "is_draft_worker", False),
+            ),
+            graph_pool_replay_scope(),
+        ):
             self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 

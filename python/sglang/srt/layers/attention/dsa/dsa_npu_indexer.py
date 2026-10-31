@@ -16,6 +16,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.npu_graph_debug import (
+    npu_graph_debug,
+    npu_graph_debug_call,
+)
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_prefill_graph_scope,
@@ -65,14 +69,17 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
 def bcg_npu_dsa_indexer(
     indexer, x, q_lora, positions, out, layer_id, input_on_attn_tp_slices, dynamic_scale
 ) -> None:
+    npu_graph_debug("indexer.break.begin", layer=layer_id, x=x, q_lora=q_lora, out=out)
     # Resolve request metadata at replay, not when the graph was captured.
     batch = get_forward_batch()
     n = batch.global_num_token_non_padded_cpu
+    npu_graph_debug("indexer.break.batch", layer=layer_id, batch=batch, real_tokens=n)
     assert n is not None and 0 <= n <= out.shape[0]
-    out.fill_(-1)
+    npu_graph_debug_call("indexer.output.fill", out.fill_, -1)
     if n == 0:
         # The count is shared by the attn-TP group. Other DP groups still
         # participate in the subsequent MoE/EP communication as usual.
+        npu_graph_debug("indexer.break.idle", layer=layer_id)
         return
     result = indexer._forward_npu_eager(
         x,
@@ -84,7 +91,8 @@ def bcg_npu_dsa_indexer(
         dynamic_scale,
         real_num_tokens=n,
     )
-    out[:n].copy_(result)
+    npu_graph_debug_call("indexer.output.copy", out[:n].copy_, result)
+    npu_graph_debug("indexer.break.return", layer=layer_id)
 
 
 class DSANPUIndexerMixin:
@@ -98,8 +106,25 @@ class DSANPUIndexerMixin:
         input_on_attn_tp_slices: bool = False,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
+        npu_graph_debug(
+            "indexer.entry",
+            layer=layer_id,
+            batch=forward_batch,
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            dynamic_scale=dynamic_scale,
+            bcg=is_in_breakable_cuda_graph(),
+            prefill_scope=is_in_prefill_graph_scope(),
+            eager_break=envs.SGLANG_NPU_DSA_INDEXER_EAGER_BREAK.get(),
+            ag_after_qlora=_use_ag_after_qlora,
+            input_on_attn_tp_slices=input_on_attn_tp_slices,
+            cp=self.dsa_enable_prefill_cp,
+            alt_stream=getattr(self.alt_stream, "stream_id", None),
+        )
         if (
-            is_in_breakable_cuda_graph()
+            envs.SGLANG_NPU_DSA_INDEXER_EAGER_BREAK.get()
+            and is_in_breakable_cuda_graph()
             and is_in_prefill_graph_scope()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
@@ -147,6 +172,9 @@ class DSANPUIndexerMixin:
         *,
         real_num_tokens: int = None,
     ) -> torch.Tensor:
+        npu_graph_debug(
+            "indexer.compute.begin", layer=layer_id, real_tokens=real_num_tokens
+        )
         # DSA prefill CP metadata is Ascend-local and is first consumed by this
         # indexer (before the attention backend's forward_extend), so prepare it
         # here rather than in the shared eager runner.
@@ -157,6 +185,12 @@ class DSANPUIndexerMixin:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
             actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
+        npu_graph_debug(
+            "indexer.metadata",
+            layer=layer_id,
+            block_table=attn_backend.forward_metadata.block_tables,
+            kv_lengths=actual_seq_lengths_kv,
+        )
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -165,6 +199,7 @@ class DSANPUIndexerMixin:
 
         bs = q_lora.shape[0]
 
+        npu_graph_debug("indexer.projections.begin", layer=layer_id)
         if self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
                 cos_sin = self.rotary_emb.cos_sin_cache[positions]
@@ -286,6 +321,9 @@ class DSANPUIndexerMixin:
             q = torch.cat([q_pe, q_nope], dim=-1)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
+        npu_graph_debug(
+            "indexer.projections.return", layer=layer_id, q=q, k=k, weights=weights
+        )
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
@@ -336,8 +374,20 @@ class DSANPUIndexerMixin:
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
-            pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
-        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
+            npu_graph_debug_call(
+                "indexer.scale_cache.write",
+                pool.set_index_k_scale_buffer,
+                layer_id,
+                indexer_cache_loc,
+                k_scale,
+            )
+        npu_graph_debug_call(
+            "indexer.k_cache.write",
+            pool.set_index_k_buffer,
+            layer_id,
+            indexer_cache_loc,
+            k,
+        )
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
@@ -415,15 +465,22 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                topk_indices = npu_graph_debug_call(
+                    "indexer.quant_topk",
+                    torch_npu.npu_quant_lightning_indexer,
                     query=query,
                     key=past_key_states,
                     weights=weights,
                     query_dequant_scale=query_scale,
                     key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
+                    actual_seq_lengths_query=npu_graph_debug_call(
+                        "indexer.q_lengths.to", actual_seq_lengths_q.to, torch.int32
+                    ),
+                    actual_seq_lengths_key=npu_graph_debug_call(
+                        "indexer.kv_lengths.to",
+                        actual_seq_lengths_kv.to,
+                        device=k.device,
+                        dtype=torch.int32,
                     ),
                     block_table=block_table,
                     layout_query="TND",
@@ -435,14 +492,18 @@ class DSANPUIndexerMixin:
                 )
                 return topk_indices.squeeze(1)
 
-            topk_indices = torch_npu.npu_lightning_indexer(
+            topk_indices = npu_graph_debug_call(
+                "indexer.topk",
+                torch_npu.npu_lightning_indexer,
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
                 weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                    torch.int32
+                actual_seq_lengths_query=npu_graph_debug_call(
+                    "indexer.q_lengths.to", actual_seq_lengths_q.to, torch.int32
                 ),
+                actual_seq_lengths_key=npu_graph_debug_call(
+                    "indexer.kv_lengths.to", actual_seq_lengths_kv.to, k.device
+                ).to(torch.int32),
                 block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
@@ -497,5 +558,10 @@ def scattered_to_tp_attn_full(
         ),
         hidden_states,
     )
-    attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+    npu_graph_debug_call(
+        "indexer.attn_tp_gather",
+        attn_tp_all_gather_into_tensor,
+        hidden_states,
+        local_hidden_states.contiguous(),
+    )
     return hidden_states

@@ -38,6 +38,9 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
+from sglang.srt.model_executor.runner_backend_utils.npu_graph_debug import (
+    npu_graph_debug,
+)
 from sglang.srt.utils import get_device_module, is_hip, is_npu, is_musa, is_xpu
 
 if TYPE_CHECKING:
@@ -279,6 +282,7 @@ def eager_on_graph(
         return lambda inner: inner
 
     def decorator(inner: Callable):
+        @functools.wraps(inner)
         def run(*args, **kwargs) -> None:
             out = inner(*args, **kwargs)
             assert out is None, (
@@ -303,6 +307,7 @@ def eager_on_graph(
                 kwargs = dict(kwargs, out=output)
 
             # End the segment that captured up to this break point.
+            npu_graph_debug("break.record.begin", fn=inner.__qualname__)
             capture._end_current_segment()
 
             if on_capture is not None:
@@ -330,6 +335,7 @@ def eager_on_graph(
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
             capture._begin_new_segment()
+            npu_graph_debug("break.record.return", fn=inner.__qualname__)
             return output
 
         return functools.update_wrapper(_EagerOnGraphCallable(wrapper, inner), inner)
@@ -362,9 +368,14 @@ class BreakableCUDAGraph:
                     self._segments, self._hicache_wait_nodes
                 )
             for i, seg in enumerate(self._segments):
+                npu_graph_debug("segment.submit.begin", segment=i)
                 seg.replay()
+                # This records host submission, not device completion.
+                npu_graph_debug("segment.submit.return", segment=i)
                 if i < len(self._break_fns):
+                    npu_graph_debug("break.begin", segment=i, fn=self._break_fns[i])
                     self._break_fns[i]()
+                    npu_graph_debug("break.return", segment=i)
         finally:
             _current_stream_var.reset(token)
 
@@ -440,6 +451,9 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
+        npu_graph_debug(
+            "segment.capture_begin.begin", segment=len(self.cuda_graph._segments)
+        )
         graph_cls = _device_graph_cls()
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
@@ -465,8 +479,14 @@ class BreakableCUDAGraphCapture:
                 pool=self._pool, capture_error_mode=self._capture_error_mode
             )
         self._current_graph = graph
+        npu_graph_debug(
+            "segment.capture_begin.return", segment=len(self.cuda_graph._segments)
+        )
 
     def _end_current_segment(self) -> None:
+        npu_graph_debug(
+            "segment.capture_end.begin", segment=len(self.cuda_graph._segments)
+        )
         # Auto-join any side streams forked during this segment but not joined.
         main_stream = get_current_stream()
         forked = _forked_streams_var.get()
@@ -487,6 +507,9 @@ class BreakableCUDAGraphCapture:
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
+        npu_graph_debug(
+            "segment.capture_end.return", segment=len(self.cuda_graph._segments) - 1
+        )
 
 
 @eager_on_graph
