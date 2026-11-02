@@ -20,7 +20,7 @@ from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _request(rid: str) -> GenerateReqInput:
