@@ -450,9 +450,11 @@ class CompressorAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        if in_prefill_graph(forward_batch):
-            bcg_dsv4_compressor(x=x, compressor=compressor)
-            return
+        # EXPERIMENT: break disabled, the compressor stays inside the segment.
+        # Restore by reinstating:
+        #     if in_prefill_graph(forward_batch):
+        #         bcg_dsv4_compressor(x=x, compressor=compressor)
+        #         return
         compressor(x, forward_batch)
 
     # The NPU fused compressor writes c4/indexer payloads identically.
@@ -923,17 +925,14 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        if in_prefill_graph(forward_batch):
-            # A break runs on the replay stream after the preceding segment,
-            # so q_lora is ready without the capture-time event.
-            bcg_dsv4_c4_indexer(
-                backend=self,
-                x=x,
-                q_lora=q_lora,
-                c4_indexer=c4_indexer,
-                skip_compressor=skip_compressor,
-            )
-            return
+        # EXPERIMENT: break disabled, the indexer stays inside the segment.
+        # Restore by reinstating:
+        #     if in_prefill_graph(forward_batch):
+        #         bcg_dsv4_c4_indexer(
+        #             backend=self, x=x, q_lora=q_lora,
+        #             c4_indexer=c4_indexer, skip_compressor=skip_compressor,
+        #         )
+        #         return
         self.forward_c4_indexer_eager(
             x=x,
             q_lora=q_lora,
