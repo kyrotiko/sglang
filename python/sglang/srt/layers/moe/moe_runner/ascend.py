@@ -668,7 +668,10 @@ def _allgather_weighted_sum(
     """Weighted top-k sum over the full gathered route capacity.
 
     Finalize mode 2 requires the full ``[global_tokens * top_k, hidden]``
-    shape; unused capacity rows are zeroed so dropped routes never read NaN.
+    shape.  It only reads the rows ``expanded_row_idx`` points at: local routes
+    index their own row, and every dropped route is remapped to the last row.
+    The buffer is therefore left uninitialized and only that sentinel row is
+    cleared, which keeps a zero weight from multiplying leftover NaNs.
     """
     if (
         state.num_routes is None
@@ -679,17 +682,16 @@ def _allgather_weighted_sum(
     ):
         raise RuntimeError("allgather forward state is incomplete")
     hidden_states = runner_output.hidden_states
-    expert_output = torch.zeros(
+    expert_output = torch.empty(
         (state.num_routes, runner_config.hidden_size),
         dtype=torch.float32,
         device=hidden_states.device,
     )
     expert_output[: hidden_states.shape[0]].copy_(hidden_states)
-    unused_rows = (
-        torch.arange(expert_output.shape[0], device=expert_output.device)
-        >= state.expert_tokens.sum()
-    )
-    expert_output.masked_fill_(unused_rows[:, None], 0)
+    if runner_config.num_local_experts < runner_config.num_experts:
+        # With every expert local there are no dropped routes, so the last row
+        # is a real route and must keep its value.
+        expert_output[-1:].zero_()
     # Keep weighted expert sums in FP32 across ranks: rounding each rank's
     # partial output to BF16 before the ReduceScatter loses precision.
     return npu_moe_finalize_routing(
