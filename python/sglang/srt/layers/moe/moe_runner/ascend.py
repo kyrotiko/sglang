@@ -684,7 +684,7 @@ def _allgather_weighted_sum(
     hidden_states = runner_output.hidden_states
     expert_output = torch.empty(
         (state.num_routes, runner_config.hidden_size),
-        dtype=torch.float32,
+        dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
     expert_output[: hidden_states.shape[0]].copy_(hidden_states)
