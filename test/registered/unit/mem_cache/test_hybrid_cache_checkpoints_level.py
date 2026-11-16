@@ -19,7 +19,7 @@ from sglang.test.kits.unified_radix_cache.config import CacheConfig
 from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 PROMPT = list(range(1, 17))
 
