@@ -45,6 +45,7 @@ def _backend():
         device="cpu",
         page_size=128,
         max_context_len=4096,
+        _dsv4_has_low_ratio=False,
         _dsv4_has_c4=True,
         _dsv4_has_c128=True,
         _dsv4_unique_compress_ratios=[4, 128],
